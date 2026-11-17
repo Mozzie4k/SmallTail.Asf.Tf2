@@ -21,58 +21,88 @@ public class Tf2Plugin : IPlugin, IBotCommand2, IBotSteamClient
         ASF.ArchiLogger.LogGenericInfo("SmallTail TF2 loaded! ^-^");
     }
     
-    public async Task<string?> OnBotCommand(Bot bot, EAccess access, string message, string[] args, ulong steamID = 0)
+public async Task<string?> OnBotCommand(Bot bot, EAccess access, string message, string[] args, ulong steamID = 0)
+{
+    if (args.Length == 0)
     {
-        if (args.Length < 2)
-        {
-            return null;
-        }
-
-        var command = args[0].ToLower();
-        var botName = args[1].ToLower();
-        
-        if (botName == "asf")
-        {
-            return null;
-        }
-        
-        Func<Bot, Tf2BotHandler, string[], Task<string?>>? handler = command switch
-        {
-            "tf2slots" => HandleTf2Slots,
-            "tf2premium" => HandleTf2Premium,
-            
-            "tf2useid" => HandleTf2UseId,
-            "tf2usedef" => HandleTf2UseDef,
-            
-            "tf2rm" => HandleTf2Rm,
-            "tf2rmdef" => HandleTf2RmDef,
-            
-            "tf2bec" => HandleTf2ExpanderCount,
-            "tf2beu" => HandleTf2ExpanderUse,
-            _ => null
-        };
-
-        if (handler is null)
-        {
-            return null;
-        }
-        
-        var commandBot = Bot.BotsReadOnly?
-            .FirstOrDefault(b => b.Key.ToLower() == botName)
-            .Value;
-
-        if (commandBot is null)
-        {
-            return $"<{botName}> Bot not found";
-        }
-
-        if (!_tf2BotHandlers.TryGetValue(commandBot.BotName, out var tf2BotHandler))
-        {
-            return $"<{commandBot.BotName}> Failed to get Tf2BotHandler";
-        }
-        
-        return await handler(commandBot, tf2BotHandler, args);
+        return null;
     }
+
+    var command = args[0].ToLowerInvariant();
+
+    Func<Bot, Tf2BotHandler, string[], Task<string?>>? handler = command switch
+    {
+        "tf2slots" => HandleTf2Slots,
+        "tf2premium" => HandleTf2Premium,
+
+        "tf2useid" => HandleTf2UseId,
+        "tf2usedef" => HandleTf2UseDef,
+
+        "tf2rm" => HandleTf2Rm,
+        "tf2rmdef" => HandleTf2RmDef,
+
+        "tf2bec" => HandleTf2ExpanderCount,
+        "tf2beu" => HandleTf2ExpanderUse,
+        _ => null
+    };
+
+    if (handler is null)
+    {
+        return null;
+    }
+
+    // These commands use/delete items - don't let anyone below Master run them
+    if (access < EAccess.Master)
+    {
+        return null;
+    }
+
+    HashSet<Bot>? bots;
+
+    if (args.Length >= 2)
+    {
+        // "ASF", "bot1,bot2", "@all" etc. are all handled by ASF itself
+        bots = Bot.GetBots(args[1]);
+
+        if (bots is null || bots.Count == 0)
+        {
+            return $"<{args[1]}> Bot not found";
+        }
+    }
+    else
+    {
+        // No bot given -> use the bot that received the command,
+        // and insert its name so args[2]/args[3] indexes in the handlers still line up
+        bots = [bot];
+        args = [args[0], bot.BotName];
+    }
+
+    var results = await Utilities.InParallel(bots.Select(async b =>
+    {
+        if (!b.IsConnectedAndLoggedOn)
+        {
+            return $"<{b.BotName}> Bot is not connected";
+        }
+
+        if (!_tf2BotHandlers.TryGetValue(b.BotName, out var tf2BotHandler))
+        {
+            return $"<{b.BotName}> Failed to get Tf2BotHandler";
+        }
+
+        try
+        {
+            return await handler(b, tf2BotHandler, args);
+        }
+        catch (Exception e)
+        {
+            return $"<{b.BotName}> Error: {e.Message}";
+        }
+    }));
+
+    var responses = results.Where(r => !string.IsNullOrEmpty(r)).ToList();
+
+    return responses.Count > 0 ? string.Join(Environment.NewLine, responses) : null;
+}
 
     private async Task<string?> HandleTf2Slots(Bot bot, Tf2BotHandler tf2BotHandler, string[] args)
     {
