@@ -1,248 +1,361 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Composition;
+using System.Linq;
+using System.Threading.Tasks;
+using ArchiSteamFarm.Core;
+using ArchiSteamFarm.Plugins.Interfaces;
 using ArchiSteamFarm.Steam;
-using SmallTail.Asf.TfBackpack.Models;
 using SteamKit2;
-using SteamKit2.GC;
-using SteamKit2.GC.TF2.Internal;
 
-namespace SmallTail.Asf.TfBackpack;
+namespace SmallTail.Asf.Tf2;
 
-public class Tf2BotHandler
+[Export(typeof(IPlugin))]
+public class Tf2Plugin : IPlugin, IBotCommand2, IBotSteamClient
 {
-    private const uint AppId = 440;
-    private static readonly TimeSpan ItemsUseDelay = TimeSpan.FromSeconds(1);
-    private static readonly TimeSpan ItemsDeleteDelay = TimeSpan.FromSeconds(1);
-    
-    public bool IsPremium;
-    public uint SlotCount;
-    public List<CSOEconItem> Items = new();
-    
-    private readonly Bot _bot;
-    private readonly SteamGameCoordinator _steamGameCoordinator;
+    public string Name => "SmallTail TF2";
+    public Version Version => typeof(Tf2Plugin).Assembly.GetName().Version ?? new Version(1, 0, 0, 0);
 
-    private TaskCompletionSource? _accountLoaded;
-    private TaskCompletionSource? _itemsLoaded;
+    /// <summary>How long we wait for the TF2 game coordinator before giving up on a bot.</summary>
+    private static readonly TimeSpan GcTimeout = TimeSpan.FromSeconds(30);
 
-    public Tf2BotHandler(Bot bot)
+    private readonly ConcurrentDictionary<string, Tf2BotHandler> _tf2BotHandlers = new();
+
+    public Task OnLoaded()
     {
-        _bot = bot;
-        
-        _steamGameCoordinator = _bot.GetHandler<SteamGameCoordinator>()!;
+        ASF.ArchiLogger.LogGenericInfo("SmallTail TF2 loaded! ^-^");
+        return Task.CompletedTask;
     }
 
-    public async Task<(TaskCompletionSource AccountLoaded, TaskCompletionSource ItemsLoaded)> Connect()
-    {
-        _accountLoaded = new TaskCompletionSource();
-        _itemsLoaded = new TaskCompletionSource();
-        
-        await _bot.Actions.Play([AppId]);
-        
-        var clientHello = new ClientGCMsgProtobuf<CMsgClientHello>((uint)EGCBaseClientMsg.k_EMsgGCClientHello);
-        _steamGameCoordinator.Send(clientHello, AppId);
+    // ---------------------------------------------------------------------
+    //  IBotSteamClient
+    // ---------------------------------------------------------------------
 
-        return (_accountLoaded, _itemsLoaded);
+    public Task OnBotSteamCallbacksInit(Bot bot, CallbackManager callbackManager)
+    {
+        return Task.CompletedTask;
     }
 
-    public async Task Disconnect()
+    public Task<IReadOnlyCollection<ClientMsgHandler>?> OnBotSteamHandlersInit(Bot bot)
     {
-        await _bot.Actions.Play([]);
+        var handler = new Tf2BotHandler(bot);
+        _tf2BotHandlers[bot.BotName] = handler;
 
-        _bot.Actions.Resume();
+        return Task.FromResult<IReadOnlyCollection<ClientMsgHandler>?>(new ClientMsgHandler[] { handler });
     }
 
-    public void OnGCMessage(SteamGameCoordinator.MessageCallback callback)
+    // ---------------------------------------------------------------------
+    //  IBotCommand2
+    // ---------------------------------------------------------------------
+
+    public async Task<string?> OnBotCommand(Bot bot, EAccess access, string message, string[] args, ulong steamID = 0)
     {
-        Action<SteamGameCoordinator.MessageCallback>? handler = callback.EMsg switch
+        if (args.Length == 0)
         {
-            (uint)ESOMsg.k_ESOMsg_CacheSubscriptionCheck => HandleSoCoacheSubscriptionCheck,
-            (uint)ESOMsg.k_ESOMsg_CacheSubscribed => HandleSoCacheSubscribed,
-            (uint)ESOMsg.k_ESOMsg_Update => HandleSoUpdate,
-            (uint)ESOMsg.k_ESOMsg_UpdateMultiple => HandleSoUpdateMultiple,
-            (uint)ESOMsg.k_ESOMsg_Destroy => HandleSoDestroy,
+            return null;
+        }
+
+        var command = args[0].ToLowerInvariant();
+
+        Func<Bot, Tf2BotHandler, string[], Task<string?>>? handler = command switch
+        {
+            "tf2slots"   => HandleTf2Slots,
+            "tf2premium" => HandleTf2Premium,
+
+            "tf2useid"   => HandleTf2UseId,
+            "tf2usedef"  => HandleTf2UseDef,
+
+            "tf2rm"      => HandleTf2Rm,
+            "tf2rmdef"   => HandleTf2RmDef,
+
+            "tf2bec"     => HandleTf2ExpanderCount,
+            "tf2beu"     => HandleTf2ExpanderUse,
+
             _ => null
         };
 
-        handler?.Invoke(callback);
-    }
-
-    private void HandleSoCoacheSubscriptionCheck(SteamGameCoordinator.MessageCallback callback)
-    {
-        var refreshRequest = new ClientGCMsgProtobuf<CMsgSOCacheSubscriptionRefresh>((uint)ESOMsg.k_ESOMsg_CacheSubscriptionRefresh);
-        refreshRequest.Body.owner = _bot.SteamID;
-            
-        _steamGameCoordinator.Send(refreshRequest, AppId);
-    }
-
-    private void HandleSoCacheSubscribed(SteamGameCoordinator.MessageCallback callback)
-    {
-        var response = new ClientGCMsgProtobuf<CMsgSOCacheSubscribed>(callback.Message);
-        
-        foreach (var subscribedType in response.Body.objects)
+        if (handler is null)
         {
-            switch (subscribedType.type_id)
+            return null; // not our command
+        }
+
+        // All of these use or delete items - require Master
+        if (access < EAccess.Master)
+        {
+            return null;
+        }
+
+        HashSet<Bot>? bots;
+
+        if (args.Length >= 2)
+        {
+            // Lets ASF resolve "ASF", "bot1,bot2", "@all", "bot1..bot5" etc.
+            bots = Bot.GetBots(args[1]);
+
+            if (bots is null || bots.Count == 0)
             {
-                case 1:
-                {
-                    var items = subscribedType.object_data.Select(obj =>
-                    {
-                        using var memoryStream = new MemoryStream(obj);
-
-                        var item = ProtoBuf.Serializer.Deserialize<CSOEconItem>(memoryStream);
-
-                        return item;
-                    }).ToList();
-
-                    Items = items;
-                
-                    _itemsLoaded?.TrySetResult();
-                    break;
-                }
-                case 7:
-                {
-                    using var memoryStream = new MemoryStream(subscribedType.object_data[0]);
-                
-                    var client = ProtoBuf.Serializer.Deserialize<CSOEconGameAccountClient>(memoryStream);
-
-                    IsPremium = !client.trial_account;
-                    SlotCount = (client.trial_account ? 50u : 300u) + client.additional_backpack_slots;
-                
-                    _accountLoaded?.TrySetResult();
-                    break;
-                }
+                return $"<{args[1]}> Bot not found";
             }
         }
-    }
-
-    private void HandleSoUpdate(SteamGameCoordinator.MessageCallback callback)
-    {
-        var response = new ClientGCMsgProtobuf<CMsgSOSingleObject>(callback.Message);
-        
-        var singleObject = ProtoBuf.Serializer.Deserialize<CMsgSOMultipleObjects.SingleObject>(response.Payload);
-        
-        ProcessSingleObjectUpdate(singleObject);
-    }
-
-    private void HandleSoUpdateMultiple(SteamGameCoordinator.MessageCallback callback)
-    {
-        var response = new ClientGCMsgProtobuf<CMsgSOMultipleObjects>(callback.Message);
-        
-        var multipleObjects = ProtoBuf.Serializer.Deserialize<CMsgSOMultipleObjects>(response.Payload);
-        
-        foreach (var singleObject in multipleObjects.objects)
+        else
         {
-            ProcessSingleObjectUpdate(singleObject);
+            // No bot given -> act on the bot that received the message.
+            // Insert its name so args[2]/args[3] still line up in the handlers.
+            bots = new HashSet<Bot> { bot };
+            args = new[] { args[0], bot.BotName };
         }
-    }
 
-    private void ProcessSingleObjectUpdate(CMsgSOMultipleObjects.SingleObject singleObject)
-    {
-        switch (singleObject.type_id)
+        var results = await Utilities.InParallel(bots.Select(async b =>
         {
-            case 1:
+            if (!b.IsConnectedAndLoggedOn)
             {
-                using var memoryStream = new MemoryStream(singleObject.object_data);
-
-                var item = ProtoBuf.Serializer.Deserialize<CSOEconItem>(memoryStream);
-                
-                for (var i = 0; i < Items.Count; i++)
-                {
-                    if (Items[i].id == item.id)
-                    {
-                        Items[i] = item;
-                    }
-                }
-                
-                break;
+                return $"<{b.BotName}> Bot is not connected";
             }
-            case 7:
+
+            if (!_tf2BotHandlers.TryGetValue(b.BotName, out var tf2BotHandler))
             {
-                using var memoryStream = new MemoryStream(singleObject.object_data);
-                
-                var client = ProtoBuf.Serializer.Deserialize<CSOEconGameAccountClient>(memoryStream);
-
-                IsPremium = !client.trial_account;
-                SlotCount = (client.trial_account ? 50u : 300u) + client.additional_backpack_slots;
-                
-                break;
+                return $"<{b.BotName}> Failed to get Tf2BotHandler";
             }
-        }
-    }
 
-    private void HandleSoDestroy(SteamGameCoordinator.MessageCallback callback)
-    {
-        var response = new ClientGCMsgProtobuf<CMsgSOSingleObject>(callback.Message);
-        var singleObject = ProtoBuf.Serializer.Deserialize<CMsgSOMultipleObjects.SingleObject>(response.Payload);
-
-        if (singleObject.type_id != 1)
-        {
-            return; // Not an item
-        }
-        
-        using var memoryStream = new MemoryStream(singleObject.object_data);
-
-        var item = ProtoBuf.Serializer.Deserialize<CSOEconItem>(memoryStream);
-        
-        for (var i = 0; i < Items.Count; i++)
-        {
-            if (Items[i].id == item.id)
+            try
             {
-                Items.RemoveAt(i);
+                return await handler(b, tf2BotHandler, args).ConfigureAwait(false);
             }
-        }
-    }
-    
-    public void UseItem(ulong itemId)
-    {
-        var request = new ClientGCMsgProtobuf<CMsgUseItem>((uint)EGCItemMsg.k_EMsgGCUseItemRequest);
-        request.Body.item_id = itemId;
-        
-        _steamGameCoordinator.Send(request, AppId);
-    }
-    
-    public async Task UseItems(IReadOnlyCollection<CSOEconItem> items)
-    {
-        if (items.Count < 1)
-        {
-            return;
-        }
-        
-        var last = items.Last();
-        
-        foreach (var item in items)
-        {
-            UseItem(item.id);
-            
-            if (item != last)
+            catch (TimeoutException)
             {
-                await Task.Delay(ItemsUseDelay);
+                return $"<{b.BotName}> Timed out waiting for the TF2 game coordinator (does this account own TF2 / is it in-game elsewhere?)";
             }
-        }
-    }
-    
-    public void DeleteItem(ulong itemId)
-    {
-        var request = new ClientGCMsg<DeleteMsg>();
-        request.Write(itemId);
-        
-        _steamGameCoordinator.Send(request, AppId);
-    }
-    
-    public async Task DeleteItems(IReadOnlyCollection<CSOEconItem> items)
-    {
-        if (items.Count < 1)
-        {
-            return;
-        }
-        
-        var last = items.Last();
-        
-        foreach (var item in items)
-        {
-            DeleteItem(item.id);
-            
-            if (item != last)
+            catch (Exception e)
             {
-                await Task.Delay(ItemsDeleteDelay);
+                return $"<{b.BotName}> Error: {e.Message}";
             }
+        })).ConfigureAwait(false);
+
+        var responses = results.Where(r => !string.IsNullOrEmpty(r)).ToList();
+
+        return responses.Count > 0 ? string.Join(Environment.NewLine, responses) : null;
+    }
+
+    // ---------------------------------------------------------------------
+    //  Shared GC session helper
+    //  Connects, waits (with timeout) for account + items, runs the action,
+    //  and ALWAYS disconnects afterwards so a failing bot never stays "in TF2".
+    // ---------------------------------------------------------------------
+
+    private static async Task<string?> WithGc(Bot bot, Tf2BotHandler tf2BotHandler, Func<Task<string?>> action)
+    {
+        var waiters = tf2BotHandler.Connect();
+
+        try
+        {
+            await waiters.AccountLoaded.Task.WaitAsync(GcTimeout).ConfigureAwait(false);
+            await waiters.ItemsLoaded.Task.WaitAsync(GcTimeout).ConfigureAwait(false);
+
+            return await action().ConfigureAwait(false);
         }
+        finally
+        {
+            await tf2BotHandler.Disconnect().ConfigureAwait(false);
+        }
+    }
+
+    private static bool TryParseAmount(string value, int available, out int amount)
+    {
+        if (value.Equals("all", StringComparison.OrdinalIgnoreCase))
+        {
+            amount = available;
+            return true;
+        }
+
+        return int.TryParse(value, out amount) && amount > 0;
+    }
+
+    // ---------------------------------------------------------------------
+    //  Command handlers
+    //  Usage:
+    //    tf2slots   [Bots]
+    //    tf2premium [Bots]
+    //    tf2useid   [Bots] <itemId>
+    //    tf2usedef  [Bots] <defindex> <amount|all>
+    //    tf2rm      [Bots] <itemId>
+    //    tf2rmdef   [Bots] <defindex> <amount|all>
+    //    tf2bec     [Bots]
+    //    tf2beu     [Bots] <amount|all>
+    // ---------------------------------------------------------------------
+
+    private static Task<string?> HandleTf2Slots(Bot bot, Tf2BotHandler tf2BotHandler, string[] args)
+    {
+        return WithGc(bot, tf2BotHandler, () =>
+        {
+            var used = tf2BotHandler.Items.Count;
+            var total = tf2BotHandler.BackpackSlots;
+
+            return Task.FromResult<string?>($"<{bot.BotName}> Slots: {used}/{total}");
+        });
+    }
+
+    private static Task<string?> HandleTf2Premium(Bot bot, Tf2BotHandler tf2BotHandler, string[] args)
+    {
+        return WithGc(bot, tf2BotHandler, () =>
+        {
+            return Task.FromResult<string?>($"<{bot.BotName}> Premium: {(tf2BotHandler.IsPremium ? "yes" : "no")}");
+        });
+    }
+
+    private static Task<string?> HandleTf2UseId(Bot bot, Tf2BotHandler tf2BotHandler, string[] args)
+    {
+        if (args.Length < 3 || !ulong.TryParse(args[2], out var itemId))
+        {
+            return Task.FromResult<string?>($"<{bot.BotName}> Usage: tf2useid [Bots] <itemId>");
+        }
+
+        return WithGc(bot, tf2BotHandler, async () =>
+        {
+            var item = tf2BotHandler.Items.FirstOrDefault(i => i.Id == itemId);
+
+            if (item is null)
+            {
+                return $"<{bot.BotName}> Item {itemId} not found";
+            }
+
+            await tf2BotHandler.UseItem(item.Id).ConfigureAwait(false);
+
+            return $"<{bot.BotName}> Used item {itemId}";
+        });
+    }
+
+    private static Task<string?> HandleTf2UseDef(Bot bot, Tf2BotHandler tf2BotHandler, string[] args)
+    {
+        if (args.Length < 4 || !uint.TryParse(args[2], out var defIndex))
+        {
+            return Task.FromResult<string?>($"<{bot.BotName}> Usage: tf2usedef [Bots] <defindex> <amount|all>");
+        }
+
+        return WithGc(bot, tf2BotHandler, async () =>
+        {
+            var items = tf2BotHandler.Items.Where(i => i.DefIndex == defIndex).ToList();
+
+            if (items.Count == 0)
+            {
+                return $"<{bot.BotName}> No items with defindex {defIndex}";
+            }
+
+            if (!TryParseAmount(args[3], items.Count, out var amount))
+            {
+                return $"<{bot.BotName}> Invalid amount: {args[3]}";
+            }
+
+            var used = 0;
+
+            foreach (var item in items.Take(amount))
+            {
+                await tf2BotHandler.UseItem(item.Id).ConfigureAwait(false);
+                used++;
+            }
+
+            return $"<{bot.BotName}> Used {used}/{items.Count} items with defindex {defIndex}";
+        });
+    }
+
+    private static Task<string?> HandleTf2Rm(Bot bot, Tf2BotHandler tf2BotHandler, string[] args)
+    {
+        if (args.Length < 3 || !ulong.TryParse(args[2], out var itemId))
+        {
+            return Task.FromResult<string?>($"<{bot.BotName}> Usage: tf2rm [Bots] <itemId>");
+        }
+
+        return WithGc(bot, tf2BotHandler, async () =>
+        {
+            var item = tf2BotHandler.Items.FirstOrDefault(i => i.Id == itemId);
+
+            if (item is null)
+            {
+                return $"<{bot.BotName}> Item {itemId} not found";
+            }
+
+            await tf2BotHandler.DeleteItem(item.Id).ConfigureAwait(false);
+
+            return $"<{bot.BotName}> Deleted item {itemId}";
+        });
+    }
+
+    private static Task<string?> HandleTf2RmDef(Bot bot, Tf2BotHandler tf2BotHandler, string[] args)
+    {
+        // FIX: was "args.Length < 2", which let args[2] throw IndexOutOfRange
+        if (args.Length < 4 || !uint.TryParse(args[2], out var defIndex))
+        {
+            return Task.FromResult<string?>($"<{bot.BotName}> Usage: tf2rmdef [Bots] <defindex> <amount|all>");
+        }
+
+        return WithGc(bot, tf2BotHandler, async () =>
+        {
+            var items = tf2BotHandler.Items.Where(i => i.DefIndex == defIndex).ToList();
+
+            if (items.Count == 0)
+            {
+                return $"<{bot.BotName}> No items with defindex {defIndex}";
+            }
+
+            if (!TryParseAmount(args[3], items.Count, out var amount))
+            {
+                return $"<{bot.BotName}> Invalid amount: {args[3]}";
+            }
+
+            var deleted = 0;
+
+            foreach (var item in items.Take(amount))
+            {
+                await tf2BotHandler.DeleteItem(item.Id).ConfigureAwait(false);
+                deleted++;
+            }
+
+            return $"<{bot.BotName}> Deleted {deleted}/{items.Count} items with defindex {defIndex}";
+        });
+    }
+
+    private static Task<string?> HandleTf2ExpanderCount(Bot bot, Tf2BotHandler tf2BotHandler, string[] args)
+    {
+        return WithGc(bot, tf2BotHandler, () =>
+        {
+            var count = tf2BotHandler.Items.Count(i => i.DefIndex == Tf2BotHandler.BackpackExpanderDefIndex);
+
+            return Task.FromResult<string?>($"<{bot.BotName}> Backpack expanders: {count}");
+        });
+    }
+
+    private static Task<string?> HandleTf2ExpanderUse(Bot bot, Tf2BotHandler tf2BotHandler, string[] args)
+    {
+        if (args.Length < 3)
+        {
+            return Task.FromResult<string?>($"<{bot.BotName}> Usage: tf2beu [Bots] <amount|all>");
+        }
+
+        return WithGc(bot, tf2BotHandler, async () =>
+        {
+            var expanders = tf2BotHandler.Items
+                .Where(i => i.DefIndex == Tf2BotHandler.BackpackExpanderDefIndex)
+                .ToList();
+
+            if (expanders.Count == 0)
+            {
+                return $"<{bot.BotName}> No backpack expanders";
+            }
+
+            if (!TryParseAmount(args[2], expanders.Count, out var amount))
+            {
+                return $"<{bot.BotName}> Invalid amount: {args[2]}";
+            }
+
+            var used = 0;
+
+            foreach (var expander in expanders.Take(amount))
+            {
+                await tf2BotHandler.UseItem(expander.Id).ConfigureAwait(false);
+                used++;
+            }
+
+            return $"<{bot.BotName}> Used {used}/{expanders.Count} backpack expanders";
+        });
     }
 }
