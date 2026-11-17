@@ -1,23 +1,21 @@
-using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Composition;
-using System.Linq;
-using System.Threading.Tasks;
+using System.Reflection;
 using ArchiSteamFarm.Core;
 using ArchiSteamFarm.Plugins.Interfaces;
 using ArchiSteamFarm.Steam;
 using SteamKit2;
+using SteamKit2.GC.TF2.Internal;
 
-namespace SmallTail.Asf.Tf2;
+namespace SmallTail.Asf.TfBackpack;
 
 [Export(typeof(IPlugin))]
 public class Tf2Plugin : IPlugin, IBotCommand2, IBotSteamClient
 {
     public string Name => "SmallTail TF2";
-    public Version Version => typeof(Tf2Plugin).Assembly.GetName().Version ?? new Version(1, 0, 0, 0);
+    public Version Version => Assembly.GetExecutingAssembly().GetName().Version ?? throw new InvalidOperationException(nameof(Version));
 
-    /// <summary>How long we wait for the TF2 game coordinator before giving up on a bot.</summary>
+    /// <summary>How long to wait for the TF2 game coordinator before giving up on a bot.</summary>
     private static readonly TimeSpan GcTimeout = TimeSpan.FromSeconds(30);
 
     private readonly ConcurrentDictionary<string, Tf2BotHandler> _tf2BotHandlers = new();
@@ -28,26 +26,11 @@ public class Tf2Plugin : IPlugin, IBotCommand2, IBotSteamClient
         return Task.CompletedTask;
     }
 
-    // ---------------------------------------------------------------------
-    //  IBotSteamClient
-    // ---------------------------------------------------------------------
-
-    public Task OnBotSteamCallbacksInit(Bot bot, CallbackManager callbackManager)
-    {
-        return Task.CompletedTask;
-    }
-
-    public Task<IReadOnlyCollection<ClientMsgHandler>?> OnBotSteamHandlersInit(Bot bot)
-    {
-        var handler = new Tf2BotHandler(bot);
-        _tf2BotHandlers[bot.BotName] = handler;
-
-        return Task.FromResult<IReadOnlyCollection<ClientMsgHandler>?>(new ClientMsgHandler[] { handler });
-    }
-
-    // ---------------------------------------------------------------------
-    //  IBotCommand2
-    // ---------------------------------------------------------------------
+    // -----------------------------------------------------------------
+    //  Command dispatch
+    //  [Bots] is resolved by ASF itself: "ASF", "bot1,bot2", "@all", etc.
+    //  If [Bots] is omitted, the bot that received the message is used.
+    // -----------------------------------------------------------------
 
     public async Task<string?> OnBotCommand(Bot bot, EAccess access, string message, string[] args, ulong steamID = 0)
     {
@@ -56,9 +39,7 @@ public class Tf2Plugin : IPlugin, IBotCommand2, IBotSteamClient
             return null;
         }
 
-        var command = args[0].ToLowerInvariant();
-
-        Func<Bot, Tf2BotHandler, string[], Task<string?>>? handler = command switch
+        Func<Bot, Tf2BotHandler, string[], Task<string?>>? handler = args[0].ToLowerInvariant() switch
         {
             "tf2slots"   => HandleTf2Slots,
             "tf2premium" => HandleTf2Premium,
@@ -80,7 +61,7 @@ public class Tf2Plugin : IPlugin, IBotCommand2, IBotSteamClient
             return null; // not our command
         }
 
-        // All of these use or delete items - require Master
+        // These commands can use/delete items - require Master
         if (access < EAccess.Master)
         {
             return null;
@@ -90,7 +71,6 @@ public class Tf2Plugin : IPlugin, IBotCommand2, IBotSteamClient
 
         if (args.Length >= 2)
         {
-            // Lets ASF resolve "ASF", "bot1,bot2", "@all", "bot1..bot5" etc.
             bots = Bot.GetBots(args[1]);
 
             if (bots is null || bots.Count == 0)
@@ -100,10 +80,9 @@ public class Tf2Plugin : IPlugin, IBotCommand2, IBotSteamClient
         }
         else
         {
-            // No bot given -> act on the bot that received the message.
-            // Insert its name so args[2]/args[3] still line up in the handlers.
-            bots = new HashSet<Bot> { bot };
-            args = new[] { args[0], bot.BotName };
+            // No [Bots] given -> use the current bot and insert its name so args[2..] still line up
+            bots = [bot];
+            args = [args[0], bot.BotName];
         }
 
         var results = await Utilities.InParallel(bots.Select(async b =>
@@ -124,7 +103,7 @@ public class Tf2Plugin : IPlugin, IBotCommand2, IBotSteamClient
             }
             catch (TimeoutException)
             {
-                return $"<{b.BotName}> Timed out waiting for the TF2 game coordinator (does this account own TF2 / is it in-game elsewhere?)";
+                return $"<{b.BotName}> Timed out waiting for TF2 game coordinator (does this account own TF2 / is it in-game elsewhere?)";
             }
             catch (Exception e)
             {
@@ -137,20 +116,23 @@ public class Tf2Plugin : IPlugin, IBotCommand2, IBotSteamClient
         return responses.Count > 0 ? string.Join(Environment.NewLine, responses) : null;
     }
 
-    // ---------------------------------------------------------------------
-    //  Shared GC session helper
-    //  Connects, waits (with timeout) for account + items, runs the action,
-    //  and ALWAYS disconnects afterwards so a failing bot never stays "in TF2".
-    // ---------------------------------------------------------------------
+    // -----------------------------------------------------------------
+    //  Shared GC session helper: connect, wait (with timeout), run,
+    //  and ALWAYS disconnect so a failing bot never stays "in TF2".
+    // -----------------------------------------------------------------
 
-    private static async Task<string?> WithGc(Bot bot, Tf2BotHandler tf2BotHandler, Func<Task<string?>> action)
+    private static async Task<string?> WithGc(Tf2BotHandler tf2BotHandler, bool needItems, Func<Task<string?>> action)
     {
-        var waiters = tf2BotHandler.Connect();
+        var waiters = await tf2BotHandler.Connect().ConfigureAwait(false);
 
         try
         {
             await waiters.AccountLoaded.Task.WaitAsync(GcTimeout).ConfigureAwait(false);
-            await waiters.ItemsLoaded.Task.WaitAsync(GcTimeout).ConfigureAwait(false);
+
+            if (needItems)
+            {
+                await waiters.ItemsLoaded.Task.WaitAsync(GcTimeout).ConfigureAwait(false);
+            }
 
             return await action().ConfigureAwait(false);
         }
@@ -160,202 +142,203 @@ public class Tf2Plugin : IPlugin, IBotCommand2, IBotSteamClient
         }
     }
 
-    private static bool TryParseAmount(string value, int available, out int amount)
+    private static bool TryParseCount(string value, out int count)
     {
         if (value.Equals("all", StringComparison.OrdinalIgnoreCase))
         {
-            amount = available;
+            count = int.MaxValue;
             return true;
         }
 
-        return int.TryParse(value, out amount) && amount > 0;
+        return int.TryParse(value, out count) && count > 0;
     }
 
-    // ---------------------------------------------------------------------
-    //  Command handlers
-    //  Usage:
-    //    tf2slots   [Bots]
-    //    tf2premium [Bots]
-    //    tf2useid   [Bots] <itemId>
-    //    tf2usedef  [Bots] <defindex> <amount|all>
-    //    tf2rm      [Bots] <itemId>
-    //    tf2rmdef   [Bots] <defindex> <amount|all>
-    //    tf2bec     [Bots]
-    //    tf2beu     [Bots] <amount|all>
-    // ---------------------------------------------------------------------
+    // -----------------------------------------------------------------
+    //  Handlers
+    // -----------------------------------------------------------------
 
     private static Task<string?> HandleTf2Slots(Bot bot, Tf2BotHandler tf2BotHandler, string[] args)
-    {
-        return WithGc(bot, tf2BotHandler, () =>
-        {
-            var used = tf2BotHandler.Items.Count;
-            var total = tf2BotHandler.BackpackSlots;
-
-            return Task.FromResult<string?>($"<{bot.BotName}> Slots: {used}/{total}");
-        });
-    }
+        => WithGc(tf2BotHandler, needItems: false, () =>
+            Task.FromResult<string?>($"<{bot.BotName}> {tf2BotHandler.SlotCount}"));
 
     private static Task<string?> HandleTf2Premium(Bot bot, Tf2BotHandler tf2BotHandler, string[] args)
-    {
-        return WithGc(bot, tf2BotHandler, () =>
-        {
-            return Task.FromResult<string?>($"<{bot.BotName}> Premium: {(tf2BotHandler.IsPremium ? "yes" : "no")}");
-        });
-    }
+        => WithGc(tf2BotHandler, needItems: false, () =>
+            Task.FromResult<string?>($"<{bot.BotName}> {tf2BotHandler.IsPremium}"));
 
     private static Task<string?> HandleTf2UseId(Bot bot, Tf2BotHandler tf2BotHandler, string[] args)
     {
-        if (args.Length < 3 || !ulong.TryParse(args[2], out var itemId))
+        if (args.Length < 3)
         {
-            return Task.FromResult<string?>($"<{bot.BotName}> Usage: tf2useid [Bots] <itemId>");
+            return Task.FromResult<string?>($"<{bot.BotName}> <itemId> argument is required");
         }
 
-        return WithGc(bot, tf2BotHandler, async () =>
+        if (!ulong.TryParse(args[2], out var itemId))
         {
-            var item = tf2BotHandler.Items.FirstOrDefault(i => i.Id == itemId);
+            return Task.FromResult<string?>($"<{bot.BotName}> Bad item id");
+        }
 
-            if (item is null)
-            {
-                return $"<{bot.BotName}> Item {itemId} not found";
-            }
-
-            await tf2BotHandler.UseItem(item.Id).ConfigureAwait(false);
-
-            return $"<{bot.BotName}> Used item {itemId}";
+        return WithGc(tf2BotHandler, needItems: false, () =>
+        {
+            tf2BotHandler.UseItem(itemId);
+            return Task.FromResult<string?>($"<{bot.BotName}> Used");
         });
     }
 
     private static Task<string?> HandleTf2UseDef(Bot bot, Tf2BotHandler tf2BotHandler, string[] args)
     {
-        if (args.Length < 4 || !uint.TryParse(args[2], out var defIndex))
+        if (args.Length < 3)
         {
-            return Task.FromResult<string?>($"<{bot.BotName}> Usage: tf2usedef [Bots] <defindex> <amount|all>");
+            return Task.FromResult<string?>($"<{bot.BotName}> <itemDef> argument is required");
         }
 
-        return WithGc(bot, tf2BotHandler, async () =>
+        if (!uint.TryParse(args[2], out var defIndex))
         {
-            var items = tf2BotHandler.Items.Where(i => i.DefIndex == defIndex).ToList();
+            return Task.FromResult<string?>($"<{bot.BotName}> Bad item def");
+        }
 
-            if (items.Count == 0)
-            {
-                return $"<{bot.BotName}> No items with defindex {defIndex}";
-            }
+        if (args.Length < 4)
+        {
+            return Task.FromResult<string?>($"<{bot.BotName}> <count | all> argument is required");
+        }
 
-            if (!TryParseAmount(args[3], items.Count, out var amount))
-            {
-                return $"<{bot.BotName}> Invalid amount: {args[3]}";
-            }
+        if (!TryParseCount(args[3], out var count))
+        {
+            return Task.FromResult<string?>($"<{bot.BotName}> Bad count");
+        }
 
-            var used = 0;
+        return WithGc(tf2BotHandler, needItems: true, async () =>
+        {
+            var items = tf2BotHandler.Items
+                .Where(i => i.def_index == defIndex)
+                .Take(count)
+                .ToList();
 
-            foreach (var item in items.Take(amount))
-            {
-                await tf2BotHandler.UseItem(item.Id).ConfigureAwait(false);
-                used++;
-            }
+            await tf2BotHandler.UseItems(items).ConfigureAwait(false);
 
-            return $"<{bot.BotName}> Used {used}/{items.Count} items with defindex {defIndex}";
+            return $"<{bot.BotName}> Used {items.Count}";
         });
     }
 
     private static Task<string?> HandleTf2Rm(Bot bot, Tf2BotHandler tf2BotHandler, string[] args)
     {
-        if (args.Length < 3 || !ulong.TryParse(args[2], out var itemId))
+        if (args.Length < 3)
         {
-            return Task.FromResult<string?>($"<{bot.BotName}> Usage: tf2rm [Bots] <itemId>");
+            return Task.FromResult<string?>($"<{bot.BotName}> <itemId | all> argument is required");
         }
 
-        return WithGc(bot, tf2BotHandler, async () =>
+        if (args[2].Equals("all", StringComparison.OrdinalIgnoreCase))
         {
-            var item = tf2BotHandler.Items.FirstOrDefault(i => i.Id == itemId);
-
-            if (item is null)
+            return WithGc(tf2BotHandler, needItems: true, async () =>
             {
-                return $"<{bot.BotName}> Item {itemId} not found";
-            }
+                var originalItemCount = tf2BotHandler.Items.Count;
+                var currentItemCount = 0;
 
-            await tf2BotHandler.DeleteItem(item.Id).ConfigureAwait(false);
+                for (var i = 0; i < 3; i++)
+                {
+                    currentItemCount = tf2BotHandler.Items.Count;
 
-            return $"<{bot.BotName}> Deleted item {itemId}";
+                    if (currentItemCount == 0)
+                    {
+                        break;
+                    }
+
+                    await tf2BotHandler.DeleteItems(tf2BotHandler.Items.ToList()).ConfigureAwait(false);
+                    await Task.Delay(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+                }
+
+                return $"<{bot.BotName}> Item count {originalItemCount} -> {currentItemCount}";
+            });
+        }
+
+        if (!ulong.TryParse(args[2], out var itemId))
+        {
+            return Task.FromResult<string?>($"<{bot.BotName}> Bad item id");
+        }
+
+        return WithGc(tf2BotHandler, needItems: false, () =>
+        {
+            tf2BotHandler.DeleteItem(itemId);
+            return Task.FromResult<string?>($"<{bot.BotName}> Deleted");
         });
     }
 
     private static Task<string?> HandleTf2RmDef(Bot bot, Tf2BotHandler tf2BotHandler, string[] args)
     {
-        // FIX: was "args.Length < 2", which let args[2] throw IndexOutOfRange
-        if (args.Length < 4 || !uint.TryParse(args[2], out var defIndex))
+        // FIX: original checked args.Length < 2 and then read args[2]
+        if (args.Length < 3)
         {
-            return Task.FromResult<string?>($"<{bot.BotName}> Usage: tf2rmdef [Bots] <defindex> <amount|all>");
+            return Task.FromResult<string?>($"<{bot.BotName}> <itemDef> argument is required");
         }
 
-        return WithGc(bot, tf2BotHandler, async () =>
+        if (!uint.TryParse(args[2], out var defIndex))
         {
-            var items = tf2BotHandler.Items.Where(i => i.DefIndex == defIndex).ToList();
+            return Task.FromResult<string?>($"<{bot.BotName}> Bad item def");
+        }
 
-            if (items.Count == 0)
-            {
-                return $"<{bot.BotName}> No items with defindex {defIndex}";
-            }
+        return WithGc(tf2BotHandler, needItems: true, async () =>
+        {
+            var items = tf2BotHandler.Items
+                .Where(i => i.def_index == defIndex)
+                .ToList();
 
-            if (!TryParseAmount(args[3], items.Count, out var amount))
-            {
-                return $"<{bot.BotName}> Invalid amount: {args[3]}";
-            }
+            await tf2BotHandler.DeleteItems(items).ConfigureAwait(false);
 
-            var deleted = 0;
-
-            foreach (var item in items.Take(amount))
-            {
-                await tf2BotHandler.DeleteItem(item.Id).ConfigureAwait(false);
-                deleted++;
-            }
-
-            return $"<{bot.BotName}> Deleted {deleted}/{items.Count} items with defindex {defIndex}";
+            return $"<{bot.BotName}> Deleted {items.Count}";
         });
     }
 
     private static Task<string?> HandleTf2ExpanderCount(Bot bot, Tf2BotHandler tf2BotHandler, string[] args)
-    {
-        return WithGc(bot, tf2BotHandler, () =>
+        => WithGc(tf2BotHandler, needItems: true, () =>
         {
-            var count = tf2BotHandler.Items.Count(i => i.DefIndex == Tf2BotHandler.BackpackExpanderDefIndex);
-
-            return Task.FromResult<string?>($"<{bot.BotName}> Backpack expanders: {count}");
+            var count = tf2BotHandler.Items.Count(i => i.def_index == Tf2Items.BackpackExpander);
+            return Task.FromResult<string?>($"<{bot.BotName}> {count}");
         });
-    }
 
     private static Task<string?> HandleTf2ExpanderUse(Bot bot, Tf2BotHandler tf2BotHandler, string[] args)
     {
         if (args.Length < 3)
         {
-            return Task.FromResult<string?>($"<{bot.BotName}> Usage: tf2beu [Bots] <amount|all>");
+            return Task.FromResult<string?>($"<{bot.BotName}> <count | all> argument is required");
         }
 
-        return WithGc(bot, tf2BotHandler, async () =>
+        if (!TryParseCount(args[2], out var count))
+        {
+            return Task.FromResult<string?>($"<{bot.BotName}> Bad count");
+        }
+
+        return WithGc(tf2BotHandler, needItems: true, async () =>
         {
             var expanders = tf2BotHandler.Items
-                .Where(i => i.DefIndex == Tf2BotHandler.BackpackExpanderDefIndex)
+                .Where(i => i.def_index == Tf2Items.BackpackExpander)
+                .Take(count)
                 .ToList();
 
-            if (expanders.Count == 0)
-            {
-                return $"<{bot.BotName}> No backpack expanders";
-            }
+            await tf2BotHandler.UseItems(expanders).ConfigureAwait(false);
 
-            if (!TryParseAmount(args[2], expanders.Count, out var amount))
-            {
-                return $"<{bot.BotName}> Invalid amount: {args[2]}";
-            }
-
-            var used = 0;
-
-            foreach (var expander in expanders.Take(amount))
-            {
-                await tf2BotHandler.UseItem(expander.Id).ConfigureAwait(false);
-                used++;
-            }
-
-            return $"<{bot.BotName}> Used {used}/{expanders.Count} backpack expanders";
+            return $"<{bot.BotName}> Used {expanders.Count}";
         });
+    }
+
+    // -----------------------------------------------------------------
+    //  IBotSteamClient (unchanged from original)
+    // -----------------------------------------------------------------
+
+    public Task OnBotSteamCallbacksInit(Bot bot, CallbackManager callbackManager)
+    {
+        var tfBotHandler = new Tf2BotHandler(bot);
+
+        if (!_tf2BotHandlers.TryAdd(bot.BotName, tfBotHandler))
+        {
+            return Task.CompletedTask;
+        }
+
+        callbackManager.Subscribe<SteamGameCoordinator.MessageCallback>(c => tfBotHandler.OnGCMessage(c));
+
+        return Task.CompletedTask;
+    }
+
+    public Task<IReadOnlyCollection<ClientMsgHandler>?> OnBotSteamHandlersInit(Bot bot)
+    {
+        return Task.FromResult<IReadOnlyCollection<ClientMsgHandler>?>(null);
     }
 }
